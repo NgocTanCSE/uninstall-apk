@@ -14,6 +14,8 @@ import tempfile
 import shutil
 import threading
 import time
+from PIL import Image, ImageTk
+from lib.icon_manager import IconManager
 
 # ═══════════════════════════════════════════════════════════
 #  PATH CONFIGURATION
@@ -39,7 +41,9 @@ _adb_local = os.path.join(BASE_DIR, "platform-tools", "adb.exe")
 ADB_PATH = _adb_bundled if os.path.isfile(_adb_bundled) else _adb_local
 
 TEMP_DIR = os.path.join(tempfile.gettempdir(), "adb_app_manager")
+ICON_CACHE_DIR = os.path.join(tempfile.gettempdir(), "adb_app_manager_icons")
 os.makedirs(TEMP_DIR, exist_ok=True)
+os.makedirs(ICON_CACHE_DIR, exist_ok=True)
 
 # ═══════════════════════════════════════════════════════════
 #  ADB UTILITIES
@@ -331,7 +335,13 @@ class ADBAppManager(ctk.CTk):
         self.device_connected = False
         self.checked_pkgs = set()  # Checkbox state
         self.user_id = "0"
+        self.user_id = "0"
         self._stop_event = threading.Event()
+        
+        self.icon_manager = IconManager(ADB_PATH, ICON_CACHE_DIR)
+        self.app_icons = {} # pkg -> ImageTk.PhotoImage
+        self.placeholder_icon = None # Will be created in UI build
+        self._icon_threads = []
 
         self._build_ui()
         self._start_device_monitor()
@@ -483,15 +493,17 @@ class ADBAppManager(ctk.CTk):
         style.map("App.Treeview.Heading", background=[("active", "#1f2847")])
 
         columns = ("check", "name", "package", "type", "status")
-        self.tree = ttk.Treeview(table_frame, columns=columns, show="headings",
+        self.tree = ttk.Treeview(table_frame, columns=columns, show="tree headings",
                                   style="App.Treeview", selectmode="extended")
 
+        self.tree.heading("#0", text="Icon", anchor="center")
         self.tree.heading("check", text="☑", anchor="center")
         self.tree.heading("name", text="Tên ứng dụng", anchor="w")
         self.tree.heading("package", text="Package", anchor="w")
         self.tree.heading("type", text="Loại", anchor="center")
         self.tree.heading("status", text="Trạng thái", anchor="center")
 
+        self.tree.column("#0", width=42, minwidth=42, stretch=False, anchor="center")
         self.tree.column("check", width=40, minwidth=40, stretch=False, anchor="center")
         self.tree.column("name", width=200, minwidth=140)
         self.tree.column("package", width=320, minwidth=200)
@@ -610,8 +622,18 @@ class ADBAppManager(ctk.CTk):
                     self.after(0, self._update_device_ui)
                     if connected and prev_connected is not True:
                         self.after(100, self._refresh_apps)
+                
+                # Auto-refresh if app count changed (simple polling)
+                if connected:
+                    # Quick check of package count
+                    p_out, _, _ = run_adb(["shell", "pm", "list", "packages"])
+                    count = len(p_out.strip().split("\n")) if p_out else 0
+                    if hasattr(self, "_prev_app_count") and count != self._prev_app_count:
+                        self.after(100, self._refresh_apps)
+                    self._prev_app_count = count
+                
                 prev_connected = connected
-                self._stop_event.wait(3)
+                self._stop_event.wait(5)  # Increased wait to avoid over-polling
         threading.Thread(target=monitor, daemon=True).start()
 
     def _update_device_ui(self):
@@ -780,14 +802,62 @@ class ADBAppManager(ctk.CTk):
         txt = f"{shown} / {total} ứng dụng" if shown != total else f"{total} ứng dụng"
         self.count_label.configure(text=txt)
 
+    def _create_placeholder_icon(self):
+        """Create a transparent 32x32 image as placeholder."""
+        img = Image.new('RGBA', (32, 32), (0, 0, 0, 0))
+        return ImageTk.PhotoImage(img)
+
     def _render_tree(self):
         self.tree.delete(*self.tree.get_children())
+        if not self.placeholder_icon:
+            self.placeholder_icon = self._create_placeholder_icon()
+
         for app in self.filtered_apps:
             pkg = app["package"]
+            img = self.app_icons.get(pkg, self.placeholder_icon)
             check_mark = "☑" if pkg in self.checked_pkgs else "☐"
             type_text = "🔒 Hệ thống" if app["is_system"] else "👤 User"
             status_text = "✅ Bật" if app["is_enabled"] else "⛔ Tắt"
-            self.tree.insert("", "end", values=(check_mark, app["label"], pkg, type_text, status_text))
+            self.tree.insert("", "end", image=img, values=(check_mark, app["label"], pkg, type_text, status_text))
+        
+        if self.device_connected:
+            self._start_icon_loader()
+
+    def _start_icon_loader(self):
+        to_load = [a["package"] for a in self.filtered_apps if a["package"] not in self.app_icons]
+        if not to_load: return
+
+        def loader():
+            for pkg in to_load:
+                if self._stop_event.is_set(): break
+                # If cached, load immediately
+                if self.icon_manager.is_cached(pkg):
+                    self._load_and_update_icon(pkg)
+                else:
+                    # Otherwise fetch from device
+                    path = self.icon_manager.fetch_icon(pkg)
+                    if path:
+                        self._load_and_update_icon(pkg)
+        
+        threading.Thread(target=loader, daemon=True).start()
+
+    def _load_and_update_icon(self, pkg):
+        try:
+            path = self.icon_manager.get_icon_path(pkg)
+            if os.path.exists(path):
+                with Image.open(path) as img:
+                    photo = ImageTk.PhotoImage(img)
+                    self.app_icons[pkg] = photo
+                    self.after(0, lambda: self._update_tree_row_icon(pkg))
+        except:
+            pass
+
+    def _update_tree_row_icon(self, pkg):
+        for item in self.tree.get_children():
+            vals = self.tree.item(item, "values")
+            if vals and len(vals) >= 3 and vals[2] == pkg:
+                self.tree.item(item, image=self.app_icons[pkg])
+                break
 
     # ─── CHECKBOX LOGIC ─────────────────────────────────
 
